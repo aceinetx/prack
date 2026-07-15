@@ -63,7 +63,11 @@ pub const Packer = struct {
     fn packInput(self: *const @This(), io: std.Io, input: *const Input) !void {
         _ = io;
 
-        var files: std.array_list.Managed(FileData) = .init(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var allocator = arena.allocator();
+        defer arena.deinit();
+
+        var files: std.array_list.Managed(FileData) = .init(allocator);
         defer {
             for (files.items) |file| {
                 c.stbi_image_free(file.data);
@@ -96,7 +100,7 @@ pub const Packer = struct {
         }
 
         // Pack rectangles
-        var rects: std.array_list.Managed(c.stbrp_rect) = .init(self.allocator);
+        var rects: std.array_list.Managed(c.stbrp_rect) = .init(allocator);
         defer rects.deinit();
 
         for (0.., files.items) |i, *file| {
@@ -126,8 +130,8 @@ pub const Packer = struct {
         }
 
         // Write the final spritesheet
-        const data = try self.allocator.alloc(u8, @intCast(input.width * input.height * 4));
-        defer self.allocator.free(data);
+        const data = try allocator.alloc(u8, @intCast(input.width * input.height * 4));
+        defer allocator.free(data);
 
         @memset(data, 0);
 
@@ -151,11 +155,25 @@ pub const Packer = struct {
 
         if (c.stbi_write_png(input.output, input.width, input.height, 4, data.ptr, input.width * 4) == 0)
             return Error.StbiOutputWriteFailed;
+        std.debug.print("[{s}] done\n", .{input.output});
+    }
+
+    fn packInputWorker(self: *const @This(), io: std.Io, input: *const Input) void {
+        self.packInput(io, input) catch |err| {
+            std.debug.print("[{s}] error: {}\n", .{
+                input.output,
+                err,
+            });
+        };
     }
 
     pub fn pack(self: *@This(), io: std.Io) !void {
+        var g = std.Io.Group.init;
+        errdefer g.cancel(io);
+
         for (self.inputs.items) |*input| {
-            try self.packInput(io, input);
+            g.async(io, @This().packInputWorker, .{ self, io, input });
         }
+        try g.await(io);
     }
 };

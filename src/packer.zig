@@ -15,6 +15,8 @@ pub const Input = struct {
     scale: f32 = 1.0,
 };
 
+pub const EmitterFunc = *const fn (userdata: *anyopaque, io: std.Io, filename: [:0]const u8, x: i32, y: i32, width: i32, height: i32) void;
+
 const FileData = struct {
     data: []u8,
     name: [:0]const u8,
@@ -35,11 +37,13 @@ pub const Packer = struct {
 
     allocator: std.mem.Allocator,
     inputs: std.array_list.Managed(Input),
+    emitter_mutex: std.Io.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) @This() {
         return .{
             .allocator = allocator,
             .inputs = .init(allocator),
+            .emitter_mutex = .init,
         };
     }
 
@@ -47,11 +51,11 @@ pub const Packer = struct {
         self.inputs.deinit();
     }
 
-    /// Adds an input to the packer
-    /// Does not manage the strings - that's your thing
-    /// Input's strings must remain valid after pack() call
+    /// Adds an input to the packer.
+    /// Does not manage the strings - that's your thing.
+    /// Input's strings must remain valid after pack() call.
     ///
-    /// Not threadsafe
+    /// Not threadsafe.
     pub fn addInput(
         self: *@This(),
         input: Input,
@@ -65,10 +69,10 @@ pub const Packer = struct {
         try self.inputs.append(input);
     }
 
-    /// Packs an input
-    fn packInput(self: *const @This(), io: std.Io, input: *const Input) !void {
-        _ = io;
-
+    /// Packs an input.
+    ///
+    /// Threadsafe.
+    fn packInput(self: *@This(), io: std.Io, input: *const Input, emitter: ?EmitterFunc, emitter_userdata: *anyopaque) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         var allocator = arena.allocator();
         defer arena.deinit();
@@ -166,6 +170,12 @@ pub const Packer = struct {
             const file = &files.items[@intCast(rect.id)];
             std.debug.print("[{s}] writing: {s}\n", .{ input.output, file.name });
 
+            if (emitter) |f| {
+                try self.emitter_mutex.lock(io);
+                f(emitter_userdata, io, file.name, rect.x, rect.y, rect.w, rect.h);
+                self.emitter_mutex.unlock(io);
+            }
+
             for (0..@intCast(file.width * file.height)) |i| {
                 const ii: c_int = @intCast(i);
                 const x = rect.x + @rem(ii, file.width);
@@ -199,9 +209,9 @@ pub const Packer = struct {
         std.debug.print("[{s}] done\n", .{input.output});
     }
 
-    /// Worker for packInput, handles errors
-    fn packInputWorker(self: *const @This(), io: std.Io, input: *const Input) void {
-        self.packInput(io, input) catch |err| {
+    /// Worker for packInput, handles errors.
+    fn packInputWorker(self: *@This(), io: std.Io, input: *const Input, emitter: ?EmitterFunc, emitter_userdata: *anyopaque) void {
+        self.packInput(io, input, emitter, emitter_userdata) catch |err| {
             std.debug.print("[{s}] error: {}\n", .{
                 input.output,
                 err,
@@ -209,18 +219,28 @@ pub const Packer = struct {
         };
     }
 
-    /// Packs the inputs
-    /// After packing removes all inputs
+    /// Packs the inputs with an emitter. Locks the emitter function with a
+    /// mutex, so you're safe to write to emitter_userdata in the emitter
+    /// function.
+    /// After packing removes all inputs.
     ///
-    /// Not threadsafe
-    pub fn pack(self: *@This(), io: std.Io) !void {
+    /// Not threadsafe.
+    pub fn packWithEmitter(self: *@This(), io: std.Io, emitter: ?EmitterFunc, emitter_userdata: *anyopaque) !void {
         var g = std.Io.Group.init;
         errdefer g.cancel(io);
 
         for (self.inputs.items) |*input| {
-            g.async(io, @This().packInputWorker, .{ self, io, input });
+            g.async(io, @This().packInputWorker, .{ self, io, input, emitter, emitter_userdata });
         }
         try g.await(io);
         self.inputs.clearRetainingCapacity();
+    }
+
+    /// Packs the inputs.
+    /// After packing removes all inputs.
+    ///
+    /// Not threadsafe.
+    pub fn pack(self: *@This(), io: std.Io) !void {
+        try self.packWithEmitter(io, null, undefined);
     }
 };

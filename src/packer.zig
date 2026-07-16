@@ -4,17 +4,19 @@ const c = @cImport({
     @cInclude("stb_rect_pack.h");
     @cInclude("stb_image.h");
     @cInclude("stb_image_write.h");
+    @cInclude("stb_image_resize2.h");
 });
 
-const Input = struct {
+pub const Input = struct {
     filenames: []const [:0]const u8,
     output: [:0]const u8,
-    width: i32,
-    height: i32,
+    width: i32 = 1024,
+    height: i32 = 1024,
+    scale: f32 = 1.0,
 };
 
 const FileData = struct {
-    data: [*c]c.stbi_uc,
+    data: []u8,
     name: [:0]const u8,
     width: c_int,
     height: c_int,
@@ -22,12 +24,14 @@ const FileData = struct {
 };
 
 pub const Packer = struct {
-    const Error = error{
+    const PackError = error{
         StbiImageLoadFailed,
         StbrpPartiallyPacked,
         StbiOutputWriteFailed,
         UnsupportedNrChannels,
     };
+
+    const AddInputError = error{InputAlreadyTaken};
 
     allocator: std.mem.Allocator,
     inputs: std.array_list.Managed(Input),
@@ -45,21 +49,23 @@ pub const Packer = struct {
 
     /// Adds an input to the packer
     /// Does not manage the strings - that's your thing
+    /// Input's strings must remain valid after pack() call
+    ///
+    /// Not threadsafe
     pub fn addInput(
         self: *@This(),
-        filenames: []const [:0]const u8,
-        output: [:0]const u8,
-        width: i32,
-        height: i32,
+        input: Input,
     ) !void {
-        try self.inputs.append(.{
-            .filenames = filenames,
-            .output = output,
-            .width = width,
-            .height = height,
-        });
+        // Check if an output filename is already taken
+        for (self.inputs.items) |*i| {
+            if (std.mem.eql(u8, i.output, input.output)) {
+                return AddInputError.InputAlreadyTaken;
+            }
+        }
+        try self.inputs.append(input);
     }
 
+    /// Packs an input
     fn packInput(self: *const @This(), io: std.Io, input: *const Input) !void {
         _ = io;
 
@@ -70,7 +76,7 @@ pub const Packer = struct {
         var files: std.array_list.Managed(FileData) = .init(allocator);
         defer {
             for (files.items) |file| {
-                c.stbi_image_free(file.data);
+                allocator.free(file.data);
             }
             files.deinit();
         }
@@ -81,10 +87,30 @@ pub const Packer = struct {
             var h: c_int = undefined;
             var nr_channels: c_int = undefined;
             const data = c.stbi_load(file.ptr, &w, &h, &nr_channels, 0);
-            if (data == null) return Error.StbiImageLoadFailed;
-            if (nr_channels != 3) return Error.UnsupportedNrChannels;
+            if (data == null) return PackError.StbiImageLoadFailed;
+            if (nr_channels != 3 and nr_channels != 4) return PackError.UnsupportedNrChannels;
+            const w_unscaled = w;
+            const h_unscaled = h;
+            // Scale the sizes
+            const wf: f32 = @floatFromInt(w);
+            const hf: f32 = @floatFromInt(h);
+            w = @intFromFloat(wf * input.scale);
+            h = @intFromFloat(hf * input.scale);
+            // Resize the image
+            const output = try allocator.alloc(u8, @intCast(w * h * nr_channels));
+
+            const pixel_type: c.stbir_pixel_layout = switch (nr_channels) {
+                3 => c.STBIR_RGB,
+                4 => c.STBIR_RGBA,
+                else => unreachable,
+            };
+            _ = c.stbir_resize_uint8_linear(data, w_unscaled, h_unscaled, w_unscaled * nr_channels, output.ptr, w, h, w * nr_channels, pixel_type);
+
+            // Free the old image
+            c.stbi_image_free(data);
+
             try files.append(.{
-                .data = data,
+                .data = output,
                 .name = file,
                 .width = w,
                 .height = h,
@@ -112,12 +138,12 @@ pub const Packer = struct {
         }
 
         var ctx: c.stbrp_context = undefined;
-        var nodes: [128]c.stbrp_node = undefined;
-        c.stbrp_init_target(&ctx, input.width, input.height, &nodes, 128);
+        var nodes: [256]c.stbrp_node = undefined;
+        c.stbrp_init_target(&ctx, input.width, input.height, &nodes, nodes.len);
 
         const rect_count: c_int = @intCast(rects.items.len);
         if (c.stbrp_pack_rects(&ctx, rects.items.ptr, rect_count) == 0)
-            return Error.StbrpPartiallyPacked;
+            return PackError.StbrpPartiallyPacked;
 
         for (rects.items) |*rect| {
             std.debug.print("[{s}] packed: {s} ({} {} {})\n", .{
@@ -127,6 +153,7 @@ pub const Packer = struct {
                 rect.y,
                 rect.was_packed,
             });
+            std.debug.assert(rect.was_packed == 1);
         }
 
         // Write the final spritesheet
@@ -140,24 +167,39 @@ pub const Packer = struct {
             std.debug.print("[{s}] writing: {s}\n", .{ input.output, file.name });
 
             for (0..@intCast(file.width * file.height)) |i| {
-                const pixel: []u8 = file.data[(i * 3)..(i * 3 + 3)];
-
                 const ii: c_int = @intCast(i);
                 const x = rect.x + @rem(ii, file.width);
                 const y = rect.y + @divTrunc(ii, file.width);
                 const base: usize = @intCast((y * input.width + x) * 4);
-                data[base] = pixel[0];
-                data[base + 1] = pixel[1];
-                data[base + 2] = pixel[2];
-                data[base + 3] = 255;
+
+                switch (file.nr_channels) {
+                    3 => {
+                        const pixel: []u8 = file.data[(i * 3)..(i * 3 + 3)];
+
+                        data[base] = pixel[0];
+                        data[base + 1] = pixel[1];
+                        data[base + 2] = pixel[2];
+                        data[base + 3] = 255;
+                    },
+                    4 => {
+                        const pixel: []u8 = file.data[(i * 4)..(i * 4 + 4)];
+
+                        data[base] = pixel[0];
+                        data[base + 1] = pixel[1];
+                        data[base + 2] = pixel[2];
+                        data[base + 3] = pixel[3];
+                    },
+                    else => unreachable,
+                }
             }
         }
 
         if (c.stbi_write_png(input.output, input.width, input.height, 4, data.ptr, input.width * 4) == 0)
-            return Error.StbiOutputWriteFailed;
+            return PackError.StbiOutputWriteFailed;
         std.debug.print("[{s}] done\n", .{input.output});
     }
 
+    /// Worker for packInput, handles errors
     fn packInputWorker(self: *const @This(), io: std.Io, input: *const Input) void {
         self.packInput(io, input) catch |err| {
             std.debug.print("[{s}] error: {}\n", .{
@@ -167,6 +209,10 @@ pub const Packer = struct {
         };
     }
 
+    /// Packs the inputs
+    /// After packing removes all inputs
+    ///
+    /// Not threadsafe
     pub fn pack(self: *@This(), io: std.Io) !void {
         var g = std.Io.Group.init;
         errdefer g.cancel(io);
@@ -175,5 +221,6 @@ pub const Packer = struct {
             g.async(io, @This().packInputWorker, .{ self, io, input });
         }
         try g.await(io);
+        self.inputs.clearRetainingCapacity();
     }
 };

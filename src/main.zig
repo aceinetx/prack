@@ -3,11 +3,12 @@ const builtin = @import("builtin");
 const Packer = @import("packer.zig").Packer;
 
 pub fn main(init: std.process.Init) !void {
-    var allocator = std.heap.DebugAllocator(.{}).init;
-    defer _ = allocator.deinit();
-
-    var packer = Packer.init(allocator.allocator());
-    try packer.addInput(&.{ "lionbee.png", "shit.png" }, "output.png", 1024, 1024);
+    var packer = Packer.init(init.gpa);
+    try packer.addInput(.{
+        .filenames = &.{ "lionbee.png", "shit.png", "yt.png", "yt.png", "yt.png", "yt.png" },
+        .output = "output.png",
+        .scale = 1.17,
+    });
 
     try packer.pack(init.io);
 

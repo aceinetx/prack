@@ -170,6 +170,7 @@ pub const Packer = struct {
             const file = &files.items[@intCast(rect.id)];
             std.debug.print("[{s}] writing: {s}\n", .{ input.output, file.name });
 
+            // Call emitter if there is one
             if (emitter) |f| {
                 try self.emitter_mutex.lock(io);
                 f(emitter_userdata, io, file.name, rect.x, rect.y, rect.w, rect.h);
